@@ -1,0 +1,34 @@
+[workspace]
+members = [
+    # Core Modules
+    "crates/m13-core", 
+    "crates/m13-hal", 
+    "crates/m13-mem",
+    "crates/m13-pqc", 
+    "crates/m13-cipher",
+    "crates/m13-ulk",
+    "crates/m13-linux", 
+    
+    # Executables
+    "bin/m13-node",
+    "bin/m13-hub",
+    
+    # EXCLUDED (BROKEN/BLOATED):
+    # "crates/m13-flow", 
+    # "crates/m13-raptor", 
+    # "crates/m13-rlnc", 
+    # "crates/m13-safety", 
+    # "crates/m13-store", 
+    # "crates/m13-time", 
+    # "crates/m13-attest", 
+    # "crates/m13-aont", 
+    # "crates/m13-math", 
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
