@@ -5,8 +5,9 @@ use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::process::Command;
 use tun::Device;
-use std::net::{UdpSocket, SocketAddr, IpAddr};
+use std::net::{SocketAddr, IpAddr};
 use std::time::Instant;
+use socket2::{Socket, Domain, Type, Protocol, SockAddr};
 
 use m13_hal::{PhysicalInterface, LinkProperties, SecurityModule, PlatformClock, PeerAddr};
 use m13_core::{M13Error, M13Result};
@@ -14,7 +15,9 @@ use m13_core::{M13Error, M13Result};
 #[cfg(target_os = "macos")]
 const BSD_AF_INET: [u8; 4] = [0, 0, 0, 2];
 
-// [FIX] Standalone helpers instead of illegal impls
+#[cfg(target_os = "linux")]
+const MAX_BATCH: usize = 64;
+
 fn to_peer_addr(addr: SocketAddr) -> PeerAddr {
     match addr {
         SocketAddr::V4(v4) => PeerAddr::V4(v4.ip().octets(), v4.port()),
@@ -115,50 +118,136 @@ impl TunDevice {
     }
 }
 
-pub struct LinuxPhy {
-    socket: UdpSocket,
-    default_target: Option<std::net::SocketAddr>,
+pub struct LinuxUdp {
+    socket: Socket,
+    default_target: Option<PeerAddr>,
 }
 
-impl LinuxPhy {
-    pub fn new(socket: UdpSocket, target: Option<std::net::SocketAddr>) -> Self {
-        Self { socket, default_target: target }
+impl LinuxUdp {
+    pub fn new(bind_addr: &str, target_addr: Option<&str>) -> anyhow::Result<Self> {
+        let addr: SocketAddr = bind_addr.parse()?;
+        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        
+        // PHYSICS FIX: 4MB Buffers
+        let buf_size = 4 * 1024 * 1024;
+        let _ = socket.set_recv_buffer_size(buf_size);
+        let _ = socket.set_send_buffer_size(buf_size);
+        
+        socket.set_nonblocking(true)?;
+        
+        let sa: SockAddr = addr.into();
+        socket.bind(&sa)?;
+        
+        let default_target = if let Some(t) = target_addr {
+             let sa: SocketAddr = t.parse()?;
+             Some(to_peer_addr(sa))
+        } else {
+             None
+        };
+
+        Ok(Self { socket, default_target })
     }
 }
 
-impl PhysicalInterface for LinuxPhy {
+impl PhysicalInterface for LinuxUdp {
     fn properties(&self) -> LinkProperties {
         LinkProperties { mtu: 1400, bandwidth_bps: 1_000_000_000, is_reliable: false }
     }
 
     fn send(&mut self, frame: &[u8], target: Option<PeerAddr>) -> nb::Result<usize, M13Error> {
-        // [FIX] Use helper function instead of .to_socket_addr()
-        let dest = target.and_then(|p| to_socket_addr(&p))
-                         .or(self.default_target);
+        let final_target = target.or(self.default_target);
 
-        match dest {
-            Some(addr) => {
-                match self.socket.send_to(frame, addr) {
-                    Ok(n) => Ok(n),
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(nb::Error::WouldBlock),
-                    Err(_) => Err(nb::Error::Other(M13Error::HalError)),
-                }
-            },
-            None => Ok(0), 
+        let dest_peer = match final_target {
+            Some(t) => t,
+            None => return Ok(0),
+        };
+
+        let dest_sock = to_socket_addr(&dest_peer).ok_or(nb::Error::Other(M13Error::HalError))?;
+        let addr: SockAddr = dest_sock.into();
+
+        match self.socket.send_to(frame, &addr) {
+            Ok(n) => Ok(n),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Err(nb::Error::WouldBlock),
+            Err(_) => Err(nb::Error::Other(M13Error::HalError)),
         }
     }
 
     fn recv<'a>(&mut self, buf: &'a mut [u8]) -> nb::Result<(usize, PeerAddr), M13Error> {
-        match self.socket.recv_from(buf) {
-            Ok((n, src)) => {
-                // [FIX] Use helper function instead of PeerAddr::from()
-                Ok((n, to_peer_addr(src)))
-            },
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(nb::Error::WouldBlock),
+        // Zero-Copy Optimization
+        let buf_uninit = unsafe { 
+            std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>, buf.len()) 
+        };
+
+        match self.socket.recv_from(buf_uninit) {
+            Ok((n, src)) => Ok((n, to_peer_addr(src.as_socket().unwrap()))),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Err(nb::Error::WouldBlock),
             Err(_) => Err(nb::Error::Other(M13Error::HalError)),
         }
     }
+
+    // [PHYSICS] LINUX VECTOR IMPLEMENTATION (recvmmsg)
+    #[cfg(target_os = "linux")]
+    fn recv_batch(
+        &mut self, 
+        buffers: &mut [&mut [u8]], 
+        meta: &mut [(usize, PeerAddr)]
+    ) -> nb::Result<usize, M13Error> {
+        use libc::{mmsghdr, iovec, sockaddr_storage, recvmmsg, MSG_DONTWAIT};
+        use std::mem;
+
+        let fd = self.socket.as_raw_fd();
+        let count = buffers.len().min(meta.len()).min(MAX_BATCH);
+
+        // Stack-allocate C Structures (Zero Allocation)
+        let mut msg_vec: [mmsghdr; MAX_BATCH] = unsafe { mem::zeroed() };
+        let mut iov_vec: [iovec; MAX_BATCH] = unsafe { mem::zeroed() };
+        let mut addr_vec: [sockaddr_storage; MAX_BATCH] = unsafe { mem::zeroed() };
+
+        // 1. Link Rust Buffers to C Structures
+        for i in 0..count {
+            iov_vec[i].iov_base = buffers[i].as_mut_ptr() as *mut libc::c_void;
+            iov_vec[i].iov_len = buffers[i].len();
+
+            msg_vec[i].msg_hdr.msg_iov = &mut iov_vec[i];
+            msg_vec[i].msg_hdr.msg_iovlen = 1;
+            msg_vec[i].msg_hdr.msg_name = &mut addr_vec[i] as *mut _ as *mut libc::c_void;
+            msg_vec[i].msg_hdr.msg_namelen = mem::size_of::<sockaddr_storage>() as u32;
+        }
+
+        // 2. THE ATOMIC SYSCALL
+        let res = unsafe {
+            recvmmsg(fd, msg_vec.as_mut_ptr(), count as u32, MSG_DONTWAIT, std::ptr::null_mut())
+        };
+
+        if res < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(nb::Error::WouldBlock);
+            }
+            return Err(nb::Error::Other(M13Error::HalError));
+        }
+
+        // 3. Unpack Metadata
+        let pkts = res as usize;
+        for i in 0..pkts {
+            meta[i].0 = msg_vec[i].msg_len as usize;
+            
+            // Reconstruct Address
+            let addr = unsafe { 
+                socket2::SockAddr::new(addr_vec[i], msg_vec[i].msg_hdr.msg_namelen) 
+            };
+            
+            if let Some(sa) = addr.as_socket() {
+                meta[i].1 = to_peer_addr(sa);
+            }
+        }
+        Ok(pkts)
+    }
 }
+
+pub type LinuxPhy = LinuxUdp; 
 
 pub struct LinuxHsm;
 impl SecurityModule for LinuxHsm {
@@ -178,19 +267,6 @@ impl LinuxClock { pub fn new() -> Self { Self(Instant::now()) } }
 impl PlatformClock for LinuxClock {
     fn now_us(&self) -> u64 { self.0.elapsed().as_micros() as u64 }
     fn ptp_ns(&self) -> Option<u64> { None }
-}
-
-pub fn poll_both(tun_fd: RawFd, udp_fd: RawFd, timeout_ms: i32) -> (bool, bool) {
-    let mut fds = [
-        libc::pollfd { fd: tun_fd, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: udp_fd, events: libc::POLLIN, revents: 0 },
-    ];
-    let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout_ms) };
-    if ret > 0 {
-        let tun_ready = (fds[0].revents & libc::POLLIN) != 0;
-        let udp_ready = (fds[1].revents & libc::POLLIN) != 0;
-        (tun_ready, udp_ready)
-    } else { (false, false) }
 }
 
 pub mod setup;

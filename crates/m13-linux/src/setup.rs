@@ -5,7 +5,7 @@ use log::info;
 pub fn configure_hub(iface: &str, subnet: &str) -> anyhow::Result<()> {
     info!(">>> [AUTO] Configuring Linux Hub (NAT + Masquerade)...");
     Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).status()?;
-    let _ = Command::new("sh").arg("-c").arg("for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > $f; done").status();
+    let _ = Command::new("sh").arg("-c").arg("for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > ; done").status();
 
     let output = Command::new("sh").arg("-c").arg("ip route | grep default | awk '{print $5}' | head -n1").output()?;
     let wan = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -33,7 +33,8 @@ pub fn configure_node(iface: &str, hub_endpoint: &str, _tun_gw: &str) -> anyhow:
     let gateway = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if gateway.is_empty() { return Err(anyhow::anyhow!("No Gateway Detected")); }
 
-    info!(">>> ENGAGING GLOBAL ROUTING (SPRINT 27) <<<");
+    // [COSMETIC UPDATE] v0.2.0
+    info!(">>> ENGAGING GLOBAL ROUTING (v0.2.0) <<<");
     let _ = Command::new("route").args(["delete", hub_ip]).output(); 
     Command::new("route").args(["add", "-host", hub_ip, &gateway]).status()?;
 

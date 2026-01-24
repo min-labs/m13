@@ -8,8 +8,9 @@ tun = "0.5"
 anyhow = "1.0"
 log = "0.4"
 libc = "0.2"
-rand = "0.8" # For mock HSM
-nb = "1.1"   # For Non-Blocking traits
+rand = "0.8"
+nb = "1.1"
+socket2 = "0.5"
 
 m13-hal = { path = "../m13-hal" }
 m13-core = { path = "../m13-core" }

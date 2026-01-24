@@ -15,6 +15,8 @@ use m13_hal::{PhysicalInterface, SecurityModule, PlatformClock, PeerAddr};
 use m13_mem::{SlabAllocator, FrameLease};
 use m13_cipher::{M13Cipher, SessionKey};
 use m13_pqc::{KyberKeypair, kyber_encapsulate, kyber_decapsulate, dsa_sign, DsaKeypair};
+use m13_raptor::{FountainEncoder, FountainDecoder};
+use m13_flow::Pacer;
 
 use rand_core::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -22,6 +24,10 @@ use rand_chacha::ChaCha20Rng;
 pub mod fragment;
 pub mod session;
 use session::Session;
+
+// VECTOR BATCH SIZE
+const BATCH_SIZE: usize = 64;
+const RAPTOR_SYMBOL_SIZE: usize = 1024;
 
 fn is_allowed(addr: &PeerAddr) -> bool {
     match addr {
@@ -61,11 +67,19 @@ pub struct M13Kernel {
     node_target: Option<PeerAddr>,
     pending_kyber: Option<KyberKeypair>,
 
-    rx_queue: Option<FrameLease>, 
+    // [PHYSICS] Zero-Copy Batch Cache (Scalar 'rx_queue' Removed)
+    rx_batch_cache: Vec<FrameLease>, 
+
     pub tun_tx_queue: VecDeque<Vec<u8>>, 
     pub tun_rx_queue: VecDeque<Vec<u8>>,
     
     last_handshake_tx: u64,
+
+    // LIQUID VECTOR STATE
+    pacer: Pacer,
+    data_encoder: Option<(FountainEncoder, u32, Option<PeerAddr>)>, 
+    data_decoders: BTreeMap<u16, FountainDecoder>,
+    next_data_gen_id: u16,
 }
 
 impl M13Kernel {
@@ -81,7 +95,12 @@ impl M13Kernel {
         let _ = sec.get_random_bytes(&mut seed);
         let rng = ChaCha20Rng::from_seed(seed);
 
-        info!(">>> [KERNEL] v0.2.12: WATCHDOG NEUTRALIZED (NO-HEARTBEAT MODE)");
+        // [COSMETIC UPDATE] v0.2.0 Identity
+        info!(">>> [KERNEL] v0.2.0: HIGH-PERF DATA PLANE (VECTOR I/O + BBRv3 + FEC) <<<");
+        
+        // [PHYSICS CHECK] Query the math engine for truth
+        let math_engine = m13_math::get_active_engine();
+        info!(">>> [PHYSICS] MATH ACCELERATOR: {} <<<", math_engine);
 
         Self {
             phy, sec, clock, mem, config, identity,
@@ -90,10 +109,16 @@ impl M13Kernel {
             routes: BTreeMap::new(),
             node_target: None,
             pending_kyber: None,
-            rx_queue: None,
+            // rx_queue removed
+            rx_batch_cache: Vec::with_capacity(BATCH_SIZE),
             tun_tx_queue: VecDeque::new(),
             tun_rx_queue: VecDeque::new(),
             last_handshake_tx: 0,
+            
+            pacer: Pacer::new(10_000_000), 
+            data_encoder: None,
+            data_decoders: BTreeMap::new(),
+            next_data_gen_id: 1,
         }
     }
 
@@ -114,20 +139,16 @@ impl M13Kernel {
         let now = self.clock.now_us();
         let mut work_done = false;
 
+        // Session Liveness Check
         if !self.config.is_hub {
             let mut session_alive = false;
-            
-            // [FIX] WATCHDOG NEUTRALIZED
-            // We no longer kill sessions based on time. 
-            // We only check if we HAVE a cipher to determine if we need a handshake.
             for (_, session) in self.sessions.iter() {
                 if session.cipher.is_some() {
                     session_alive = true;
                 }
             }
-
             if !session_alive {
-                if now.saturating_sub(self.last_handshake_tx) > 2_000_000 { // Relaxed to 2s
+                if now.saturating_sub(self.last_handshake_tx) > 2_000_000 {
                     info!("Client: Initiating Handshake (Cold Start)...");
                     self.initiate_handshake(None); 
                     self.last_handshake_tx = now;
@@ -136,39 +157,122 @@ impl M13Kernel {
             }
         }
 
-        // RX
-        if self.rx_queue.is_none() {
-            if let Some(lease) = self.mem.alloc() { self.rx_queue = Some(lease); }
+        // [PHYSICS] ZERO-COPY BATCH RX
+        // 1. SWAP BATCH (Borrow Checker Evasion)
+        let mut batch = core::mem::take(&mut self.rx_batch_cache);
+
+        // 2. FILL CACHE (From Slab)
+        while batch.len() < BATCH_SIZE {
+            if let Some(lease) = self.mem.alloc() { batch.push(lease); }
+            else { break; }
         }
-        if let Some(frame) = self.rx_queue.as_mut() {
-            if let Ok((len, peer)) = self.phy.recv(&mut frame.data) {
-                frame.len = len;
-                if let Some(full_frame) = self.rx_queue.take() {
-                    if self.config.is_hub && !is_allowed(&peer) {
-                        warn!("Blocked unauthorized peer: {:?}", peer);
-                    } else {
-                        self.handle_packet(full_frame, peer, now);
+
+        if !batch.is_empty() {
+            // 3. PREPARE POINTERS
+            // We need a vector of mutable slices to pass to the HAL
+            let mut ptrs: Vec<&mut [u8]> = batch.iter_mut()
+                .map(|lease| &mut lease.data[..])
+                .collect();
+            
+            // Meta buffer for results (Length, PeerAddr)
+            let mut meta = alloc::vec![(0, PeerAddr::None); ptrs.len()];
+
+            // 4. VECTOR RECV
+            if let Ok(n) = self.phy.recv_batch(&mut ptrs, &mut meta) {
+                if n > 0 {
+                    work_done = true;
+                    // Process filled packets
+                    for (i, mut lease) in batch.drain(0..n).enumerate() {
+                        let (len, src) = meta[i];
+                        lease.len = len;
+                        if self.config.is_hub && !is_allowed(&src) {
+                             warn!("Blocked unauthorized peer: {:?}", src);
+                        } else {
+                             self.handle_packet(lease, src, now); 
+                        }
                     }
                 }
-                work_done = true;
             }
         }
 
-        // TX
-        if let Some(payload) = self.tun_tx_queue.pop_front() {
-            if !self.config.is_hub {
-                self.send_data_packet(payload, None);
-            } else {
-                if let Some((_, dest_vip)) = parse_ipv4_headers(&payload) {
-                    if let Some(target_peer) = self.routes.get(&dest_vip) {
-                        let peer = *target_peer;
-                        self.send_data_packet(payload, Some(peer));
-                    }
+        // 5. RESTORE CACHE (Recycle unused leases)
+        self.rx_batch_cache = batch;
+
+        // 6. PACER TICK
+        self.pacer.tick(now);
+
+        // 7. LIQUID EGRESS
+        if self.config.is_hub || !self.sessions.is_empty() {
+            if self.data_encoder.is_some() {
+                self.pump_liquid_data();
+                work_done = true;
+            } 
+            else if let Some(payload) = self.tun_tx_queue.pop_front() {
+                let target_peer = if self.config.is_hub {
+                     if let Some((_, dest_vip)) = parse_ipv4_headers(&payload) {
+                        self.routes.get(&dest_vip).cloned()
+                     } else { None }
+                } else {
+                     self.node_target
+                };
+
+                if let Ok(enc) = FountainEncoder::new(&payload, RAPTOR_SYMBOL_SIZE, self.next_data_gen_id) {
+                     self.data_encoder = Some((enc, 0, target_peer));
+                     self.next_data_gen_id = self.next_data_gen_id.wrapping_add(1);
+                     self.pump_liquid_data(); 
+                     work_done = true;
                 }
             }
-            work_done = true;
         }
+        
         work_done
+    }
+
+    fn pump_liquid_data(&mut self) {
+        if let Some((enc, sent_count, target_peer)) = &mut self.data_encoder {
+            let k = enc.num_source_symbols();
+            let overhead = core::cmp::max(1, (k * 10) / 100);
+            let target = (k + overhead) as u32;
+            let packet_cost = RAPTOR_SYMBOL_SIZE + 64; 
+
+            let mut burst = 0;
+            while *sent_count < target && burst < BATCH_SIZE {
+                if !self.pacer.chaff_needed(packet_cost) { break; }
+                
+                let (mut header, mut payload) = enc.next_packet();
+                header.packet_type = PacketType::Coded; 
+                header.reserved = k as u8;
+
+                if let Some(mut lease) = self.mem.alloc() {
+                    let cipher_ref = if let Some(t) = target_peer {
+                         self.sessions.get(t).and_then(|s| s.cipher.as_ref())
+                    } else if !self.config.is_hub {
+                         self.sessions.values().next().and_then(|s| s.cipher.as_ref())
+                    } else {
+                         None 
+                    };
+
+                    if let Some(cipher) = cipher_ref {
+                        if let Ok(tag) = cipher.encrypt_detached(&header, &mut payload) {
+                             header.auth_tag = tag;
+                        }
+                    }
+
+                    header.to_bytes(&mut lease.data).ok();
+                    lease.data[32..32+payload.len()].copy_from_slice(&payload);
+                    
+                    self.phy.send(&lease.data[..32+payload.len()], *target_peer).ok();
+                    
+                    self.pacer.consume(packet_cost);
+                    *sent_count += 1;
+                    burst += 1;
+                } else {
+                    break; 
+                }
+            }
+            
+            if *sent_count >= target { self.data_encoder = None; }
+        }
     }
 
     fn handle_packet(&mut self, mut frame: FrameLease, peer: PeerAddr, now: u64) {
@@ -215,16 +319,27 @@ impl M13Kernel {
                         }
                     }
                 },
-                PacketType::Data => {
+                PacketType::Coded | PacketType::Data => {
                     if let Some(cipher) = &session.cipher {
                         if cipher.decrypt_detached(&header, payload).is_ok() {
                             session.last_valid_rx_us = now;
-                            if is_hub {
-                                if let Some((src_vip, _)) = parse_ipv4_headers(payload) {
-                                    routes.insert(src_vip, peer);
+                            
+                            let gen_id = header.gen_id;
+                            let k = if header.reserved > 0 { header.reserved as usize } else { 1 };
+                            
+                            let decoder = self.data_decoders.entry(gen_id).or_insert_with(|| {
+                                FountainDecoder::new(k, RAPTOR_SYMBOL_SIZE, gen_id)
+                            });
+                            
+                            if let Ok(Some(decoded_data)) = decoder.receive_symbol(header.symbol_id, payload) {
+                                if is_hub {
+                                    if let Some((src_vip, _)) = parse_ipv4_headers(&decoded_data) {
+                                        routes.insert(src_vip, peer);
+                                    }
                                 }
+                                self.tun_rx_queue.push_back(decoded_data);
+                                self.data_decoders.remove(&gen_id); 
                             }
-                            self.tun_rx_queue.push_back(payload.to_vec());
                         }
                     }
                 },
@@ -279,7 +394,8 @@ impl M13Kernel {
             let ct = &payload[0..KYBER_CT_LEN_1024];
             if let Ok(ss) = kyber_decapsulate(&kp, ct) {
                 session.cipher = Some(M13Cipher::new(&SessionKey(ss)));
-                info!(">>> [NODE] SECURE CONNECTION ESTABLISHED. LINK UP.");
+                // [COSMETIC UPDATE] v0.2.0 Link Status
+                info!(">>> [NODE] v0.2.0: SECURE LINK ESTABLISHED (PQC+FEC Active).");
             }
         }
     }
@@ -318,32 +434,6 @@ impl M13Kernel {
                 }
             }
             offset += chunk_len;
-        }
-    }
-
-    fn send_data_packet(&mut self, payload: Vec<u8>, target: Option<PeerAddr>) {
-        let cipher_ref = if let Some(t) = target {
-            self.sessions.get(&t).and_then(|s| s.cipher.as_ref())
-        } else {
-            self.sessions.values().find_map(|s| s.cipher.as_ref())
-        };
-
-        if let Some(cipher) = cipher_ref {
-            if let Some(mut lease) = self.mem.alloc() {
-                let mut header = M13Header {
-                    magic: M13_MAGIC, version: 1, packet_type: PacketType::Data,
-                    gen_id: 1, symbol_id: 0, payload_len: payload.len() as u16,
-                    recoder_rank: 0, reserved: 0, auth_tag: [0; 16]
-                };
-                lease.data[32..32+payload.len()].copy_from_slice(&payload);
-                let slice = &mut lease.data[32..32+payload.len()];
-                if let Ok(tag) = cipher.encrypt_detached(&header, slice) {
-                    header.auth_tag = tag;
-                    if header.to_bytes(&mut lease.data).is_ok() {
-                        let _ = self.phy.send(&lease.data[..32+payload.len()], target);
-                    }
-                }
-            }
         }
     }
 }

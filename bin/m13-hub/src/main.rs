@@ -1,10 +1,8 @@
 use clap::Parser;
-use m13_linux::{TunDevice, LinuxPhy, LinuxHsm, LinuxClock, poll_both};
+use m13_linux::{TunDevice, LinuxUdp, LinuxHsm, LinuxClock};
 use m13_ulk::{M13Kernel, KernelConfig};
 use m13_mem::SlabAllocator;
 use m13_pqc::DsaKeypair;
-use std::net::UdpSocket;
-use std::os::unix::io::AsRawFd;
 use log::info;
 
 #[derive(Parser)]
@@ -16,18 +14,19 @@ struct Cli {
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let cli = Cli::parse();
-    info!(">>> M13 HUB: v0.2.0 (MULTI-TENANT) <<<");
+
+    // [COSMETIC UPDATE] v0.2.0 Identity
+    info!(">>> M13 HUB: v0.2.0 (HIGH-PERF DATA PLANE) <<<");
+    info!(">>> FEATURES: Vector I/O + BBRv3 + RaptorQ FEC <<<");
 
     let mut tun = TunDevice::new(&cli.iface, "10.13.13.1", "10.13.13.2")?;
     #[cfg(target_os = "linux")]
     m13_linux::setup::configure_hub(tun.name(), "10.13.13.1/24")?;
 
-    let socket = UdpSocket::bind(&cli.bind)?;
-    socket.set_nonblocking(true)?;
-
-    // Hub mode: No default target
-    let phy = LinuxPhy::new(socket.try_clone()?, None); 
-    let mem = SlabAllocator::new(4096); // Increased for multiple peers
+    // [FIX] Hub now uses Liquid Vector Driver (Socket2 + 4MB Buffers)
+    let phy = LinuxUdp::new(&cli.bind, None)?;
+    
+    let mem = SlabAllocator::new(8192); 
     
     let mut rng = rand::thread_rng();
     let identity = DsaKeypair::generate(&mut rng)?; 
@@ -43,24 +42,34 @@ fn main() -> anyhow::Result<()> {
     );
 
     info!("Hub Active. Waiting for peers on {}...", cli.bind);
-    let mut buf = [0u8; 1500];
+    let mut buf = [0u8; 65535];
 
     loop {
-        let (tun_ready, udp_ready) = poll_both(tun.fd(), socket.as_raw_fd(), 5);
+        let mut work_done = false;
 
-        if tun_ready {
-            if let Ok(n) = tun.read(&mut buf) {
-                if n > 0 { 
-                    let _ = kernel.send_payload(&buf[..n]);
-                }
+        // 1. INGRESS BATCH
+        for _ in 0..64 {
+            match tun.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    kernel.send_payload(&buf[..n]).ok();
+                    work_done = true;
+                },
+                _ => break,
             }
         }
 
-        if tun_ready || udp_ready { kernel.poll(); }
-        else { kernel.poll(); } 
+        // 2. KERNEL BATCH
+        if kernel.poll() { work_done = true; }
 
+        // 3. EGRESS BATCH
         while let Some(packet) = kernel.pop_ingress() {
             let _ = tun.write(&packet);
+            work_done = true;
+        }
+
+        // 4. ADAPTIVE YIELD
+        if !work_done {
+            std::thread::yield_now();
         }
     }
 }

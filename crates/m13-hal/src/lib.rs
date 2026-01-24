@@ -19,6 +19,15 @@ pub enum PeerAddr {
     None, // For Promiscuous/Sniffer modes
 }
 
+// Helper to keep the interface cleaner in no_std
+#[derive(Debug, Clone, Copy, Default)]
+pub struct M13Endpoint {
+    // Placeholder if we wanted full endpoint details, 
+    // but PeerAddr is our primary enum.
+    // For batching, we usually map PeerAddr directly.
+    // We will stick to PeerAddr for consistency with existing code.
+}
+
 /// The Network Interface (Section 4.2.1).
 /// INVARIANT: Must be Non-Blocking.
 pub trait PhysicalInterface: Send + Sync {
@@ -30,6 +39,27 @@ pub trait PhysicalInterface: Send + Sync {
     /// Receive data AND the source address.
     /// Returns: (bytes_read, source_addr)
     fn recv<'a>(&mut self, buffer: &'a mut [u8]) -> nb::Result<(usize, PeerAddr), M13Error>;
+
+    // [VECTOR EXTENSION]
+    // Default implementation falls back to scalar loop (for non-Linux support)
+    fn recv_batch<'a>(
+        &mut self, 
+        buffers: &mut [&mut [u8]], 
+        meta: &mut [(usize, PeerAddr)]
+    ) -> nb::Result<usize, M13Error> {
+        let mut count = 0;
+        for (i, buf) in buffers.iter_mut().enumerate() {
+            if i >= meta.len() { break; }
+            match self.recv(buf) {
+                Ok((len, ep)) => {
+                    meta[i] = (len, ep);
+                    count += 1;
+                },
+                Err(_) => break,
+            }
+        }
+        if count > 0 { Ok(count) } else { Err(nb::Error::WouldBlock) }
+    }
 }
 
 /// The Security Module (Section 4.2.2).
