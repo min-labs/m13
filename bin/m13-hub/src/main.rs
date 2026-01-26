@@ -3,7 +3,15 @@ use m13_linux::{TunDevice, LinuxUdp, LinuxHsm, LinuxClock};
 use m13_ulk::{M13Kernel, KernelConfig};
 use m13_mem::SlabAllocator;
 use m13_pqc::DsaKeypair;
-use log::info;
+use log::{info, warn};
+
+// [PHYSICS] MEMORY ALLOCATOR
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Parser)]
 struct Cli {
@@ -18,6 +26,29 @@ fn main() -> anyhow::Result<()> {
     // [COSMETIC UPDATE] v0.2.0 Identity
     info!(">>> M13 HUB: v0.2.0 (HIGH-PERF DATA PLANE) <<<");
     info!(">>> FEATURES: Vector I/O + BBRv3 + RaptorQ FEC <<<");
+
+    // [PHYSICS] CPU PINNING (IRQ AVOIDANCE)
+    // The Titan Mark-III script has turned Core 0 into an Interrupt Warzone.
+    // We must pin this process to any core EXCEPT 0.
+    if let Some(core_ids) = core_affinity::get_core_ids() {
+        // Strategy: Pick the highest numbered core (usually furthest from Core 0)
+        if let Some(target_core) = core_ids.last() {
+            let is_safe = target_core.id != 0;
+            let is_single_core = core_ids.len() == 1;
+
+            if is_safe || is_single_core {
+                if core_affinity::set_for_current(*target_core) {
+                    if is_safe {
+                        info!(">>> PHYSICS: Process Pinned to Core ID {} (SAFE ZONE).", target_core.id);
+                    } else {
+                        warn!(">>> PHYSICS WARNING: Running on Core 0 (IRQ Warzone). No other cores available.");
+                    }
+                }
+            }
+        }
+    } else {
+        warn!(">>> PHYSICS FAILURE: Could not detect CPU Topology. Running unpinned.");
+    }
 
     let mut tun = TunDevice::new(&cli.iface, "10.13.13.1", "10.13.13.2")?;
     #[cfg(target_os = "linux")]

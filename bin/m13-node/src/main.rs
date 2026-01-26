@@ -8,6 +8,14 @@ use m13_pqc::DsaKeypair;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use log::{info, warn};
 
+// [PHYSICS] MEMORY ALLOCATOR
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[derive(Parser)]
 struct Cli {
     #[arg(long)] hub: String,

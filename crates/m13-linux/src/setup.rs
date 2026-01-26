@@ -1,27 +1,46 @@
 use std::process::Command;
 use log::info;
 
+// Helper to run commands atomically (No Shell = No Syntax Errors)
+fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
+    let status = Command::new(program)
+        .args(args)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(anyhow::anyhow!("{} failed with exit code: {:?}", program, s.code())),
+        Err(e) => Err(anyhow::anyhow!("Failed to execute {}: {}", program, e)),
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn configure_hub(iface: &str, subnet: &str) -> anyhow::Result<()> {
     info!(">>> [AUTO] Configuring Linux Hub (NAT + Masquerade)...");
-    Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).status()?;
-    let _ = Command::new("sh").arg("-c").arg("for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > ; done").status();
 
-    let output = Command::new("sh").arg("-c").arg("ip route | grep default | awk '{print $5}' | head -n1").output()?;
-    let wan = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // 1. Enable IP Forwarding
+    run_cmd("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
 
-    let _ = Command::new("iptables").args(["-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-o", &wan, "-j", "MASQUERADE"]).status();
-    let _ = Command::new("iptables").args(["-A", "FORWARD", "-i", iface, "-o", &wan, "-j", "ACCEPT"]).status();
-    let _ = Command::new("iptables").args(["-A", "FORWARD", "-i", &wan, "-o", iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"]).status();
+    // 2. Clear old rules (Best Effort)
+    let _ = Command::new("iptables").args(&["-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"]).output();
+    let _ = Command::new("iptables").args(&["-D", "FORWARD", "-i", iface, "-j", "ACCEPT"]).output();
+
+    // 3. Enable NAT
+    run_cmd("iptables", &["-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-j", "MASQUERADE"])?;
+
+    // 4. Allow Forwarding
+    run_cmd("iptables", &["-A", "FORWARD", "-i", iface, "-j", "ACCEPT"])?;
+    run_cmd("iptables", &["-A", "FORWARD", "-o", iface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])?;
     
-    let _ = Command::new("ip").args(["link", "set", "dev", iface, "mtu", "1280"]).status();
+    // 5. Set MTU
+    run_cmd("ip", &["link", "set", "dev", iface, "mtu", "1280"])?;
+
+    info!(">>> [SETUP] Linux Networking Active.");
     Ok(())
 }
 
-// [FIX] Dummy implementation for macOS to allow workspace compilation
 #[cfg(not(target_os = "linux"))]
 pub fn configure_hub(_iface: &str, _subnet: &str) -> anyhow::Result<()> {
-    info!("Skipping Linux Hub configuration (Not on Linux)");
     Ok(())
 }
 
@@ -29,21 +48,32 @@ pub fn configure_hub(_iface: &str, _subnet: &str) -> anyhow::Result<()> {
 pub fn configure_node(iface: &str, hub_endpoint: &str, _tun_gw: &str) -> anyhow::Result<()> {
     let hub_ip = hub_endpoint.split(':').next().unwrap();
     
-    let output = Command::new("sh").arg("-c").arg("route -n get default | grep gateway | awk '{print $2}'").output()?;
-    let gateway = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if gateway.is_empty() { return Err(anyhow::anyhow!("No Gateway Detected")); }
+    // [PHYSICS] RUST-NATIVE GATEWAY PARSING
+    // We avoid 'sh', 'grep', and 'awk' to prevent variable expansion errors.
+    let output = Command::new("route").args(&["-n", "get", "default"]).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    // Parse: Look for line starting with "gateway:", take the second word.
+    let gateway = stdout.lines()
+        .find(|line| line.trim().starts_with("gateway:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or(anyhow::anyhow!("No Gateway Detected in Route Table"))?
+        .to_string();
 
-    // [COSMETIC UPDATE] v0.2.0
-    info!(">>> ENGAGING GLOBAL ROUTING (v0.2.0) <<<");
-    let _ = Command::new("route").args(["delete", hub_ip]).output(); 
-    Command::new("route").args(["add", "-host", hub_ip, &gateway]).status()?;
+    info!(">>> ENGAGING GLOBAL ROUTING (v0.2.1) <<<");
+    info!("Detected Physical Gateway: {}", gateway);
 
-    let _ = Command::new("route").args(["delete", "0.0.0.0/1"]).output();
-    let _ = Command::new("route").args(["delete", "128.0.0.0/1"]).output();
+    // 1. Pin the Hub IP to the physical gateway (bypass the VPN)
+    let _ = Command::new("route").args(&["delete", hub_ip]).output(); 
+    run_cmd("route", &["add", "-host", hub_ip, &gateway])?;
+
+    // 2. Split-Tunnel Hijack (0.0.0.0/1 and 128.0.0.0/1)
+    let _ = Command::new("route").args(&["delete", "0.0.0.0/1"]).output();
+    let _ = Command::new("route").args(&["delete", "128.0.0.0/1"]).output();
     
     info!("Adding Global Routes to interface: {}", iface);
-    Command::new("route").args(["add", "-net", "0.0.0.0/1", "-interface", iface]).status()?;
-    Command::new("route").args(["add", "-net", "128.0.0.0/1", "-interface", iface]).status()?;
+    run_cmd("route", &["add", "-net", "0.0.0.0/1", "-interface", iface])?;
+    run_cmd("route", &["add", "-net", "128.0.0.0/1", "-interface", iface])?;
     
     info!("[SUCCESS] Routes Configured. Internet Traffic Hijacked.");
     Ok(())

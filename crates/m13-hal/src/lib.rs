@@ -21,12 +21,7 @@ pub enum PeerAddr {
 
 // Helper to keep the interface cleaner in no_std
 #[derive(Debug, Clone, Copy, Default)]
-pub struct M13Endpoint {
-    // Placeholder if we wanted full endpoint details, 
-    // but PeerAddr is our primary enum.
-    // For batching, we usually map PeerAddr directly.
-    // We will stick to PeerAddr for consistency with existing code.
-}
+pub struct M13Endpoint;
 
 /// The Network Interface (Section 4.2.1).
 /// INVARIANT: Must be Non-Blocking.
@@ -40,9 +35,33 @@ pub trait PhysicalInterface: Send + Sync {
     /// Returns: (bytes_read, source_addr)
     fn recv<'a>(&mut self, buffer: &'a mut [u8]) -> nb::Result<(usize, PeerAddr), M13Error>;
 
-    // [VECTOR EXTENSION]
+    // [TIER 2.5] GENERIC SEGMENTATION OFFLOAD (GSO)
+    // Sends a Super-Packet (up to 64KB) which the NIC slices into segments.
+    // Default Implementation: Graceful degradation for scalar platforms (macOS).
+    fn send_gso(
+        &mut self, 
+        super_packet: &[u8], 
+        target: Option<PeerAddr>, 
+        segment_size: u16
+    ) -> nb::Result<usize, M13Error> {
+        let chunk_len = segment_size as usize;
+        let mut sent_total = 0;
+
+        // Fallback Logic: Slice the super-packet manually and send individually.
+        // This simulates GSO on non-supported hardware (at scalar cost).
+        for chunk in super_packet.chunks(chunk_len) {
+            match self.send(chunk, target) {
+                Ok(n) => sent_total += n,
+                Err(nb::Error::WouldBlock) => return Err(nb::Error::WouldBlock),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(sent_total)
+    }
+
+    // [TIER 1] VECTOR RECEIVE EXTENSION
     // Default implementation falls back to scalar loop (for non-Linux support)
-    fn recv_batch<'a>(
+    fn recv_batch(
         &mut self, 
         buffers: &mut [&mut [u8]], 
         meta: &mut [(usize, PeerAddr)]
