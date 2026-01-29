@@ -2,62 +2,85 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use m13_core::{M13Error, M13Result}; // Removed M13Header dependency here
+use m13_core::{M13Error, M13Result};
 use m13_math::{GfMatrix, GfSymbol};
 use m13_cipher::generate_coefficients;
 
+const LDPC_OVERHEAD_S: usize = 16; 
+
 /// The Fountain Decoder.
-/// Collects "droplets" until the "bucket" is full (Rank == K).
 pub struct FountainDecoder {
     block_size_k: usize,
+    extended_size_l: usize,
     symbol_size: usize,
     gen_id: u16,
     
-    // The Equation Matrix (A in Ax = b)
+    // The Equation Matrix acting on Intermediate Symbols (L)
     matrix: GfMatrix,
-    // The Received Symbols (b in Ax = b)
+    // The Symbols Vector (RHS)
     symbols: GfMatrix, 
     
-    // Tracks current fill level
     count: usize,
-    // Map of received Symbol IDs to avoid duplicates
     seen_symbols: Vec<u32>,
-    // State tracking
     is_solved: bool,
 }
 
 impl FountainDecoder {
     pub fn new(block_size_k: usize, symbol_size: usize, gen_id: u16) -> Self {
-        // OVER-PROVISIONING: Allow K + 8 symbols for overhead
-        let capacity = block_size_k + 8;
+        let extended_size_l = block_size_k + LDPC_OVERHEAD_S;
+        // Capacity: L + 8 overhead
+        let capacity = extended_size_l + 8;
         
-        Self {
+        let mut decoder = Self {
             block_size_k,
+            extended_size_l,
             symbol_size,
             gen_id,
-            matrix: GfMatrix::new(capacity, block_size_k),
+            matrix: GfMatrix::new(capacity, extended_size_l),
             symbols: GfMatrix::new(capacity, symbol_size),
             count: 0,
             seen_symbols: Vec::new(),
             is_solved: false,
+        };
+
+        // [AUDIT FIX] Initialize LDPC Constraints
+        // These are "free" equations derived from the pre-coding structure.
+        // Equation i: IS[K+i] + SUM(Neighbors in 0..K) = 0
+        for i in 0..LDPC_OVERHEAD_S {
+            let parity_idx = block_size_k + i;
+            let seed = (gen_id as u32) << 16 | (parity_idx as u32);
+            let neighbors = generate_coefficients(seed, gen_id, block_size_k);
+            
+            let row = decoder.count;
+            
+            // 1. Set Parity Coeff (Identity)
+            decoder.matrix.set(row, parity_idx, GfSymbol::ONE);
+            
+            // 2. Set Neighbor Coeffs (XOR sum -> coeff 1)
+            for j in 0..block_size_k {
+                if neighbors[j] > 128 {
+                    decoder.matrix.set(row, j, GfSymbol::ONE);
+                }
+            }
+            
+            // 3. RHS is 0 (Constraint)
+            // symbols matrix initialized to 0, so no action needed.
+            
+            decoder.count += 1;
         }
+
+        decoder
     }
 
-    /// KERNEL API COMPATIBILITY LAYER
-    /// Ingests a symbol and attempts to solve immediately if possible.
     pub fn receive_symbol(&mut self, symbol_id: u32, payload: &[u8]) -> M13Result<Option<Vec<u8>>> {
-        // 1. Absorb
         self.absorb(symbol_id, self.gen_id, payload)?;
 
-        // 2. Check if Solvable
         if self.is_decodable() && !self.is_solved {
-            // 3. Attempt Solve
             match self.decode() {
                 Ok(data) => {
                     self.is_solved = true;
                     Ok(Some(data))
                 },
-                // If singular (linear dependency), we wait for more symbols
                 Err(M13Error::CryptoFailure) => Ok(None), 
                 Err(e) => Err(e),
             }
@@ -66,28 +89,26 @@ impl FountainDecoder {
         }
     }
 
-    /// Absorb a packet (Internal Logic)
-    /// Updated signature to take raw ID/GenID instead of Header struct
     fn absorb(&mut self, symbol_id: u32, gen_id: u16, payload: &[u8]) -> M13Result<()> {
         if gen_id != self.gen_id { return Err(M13Error::WireFormatError); }
         if self.seen_symbols.contains(&symbol_id) { return Ok(()); } 
         if self.count >= self.matrix.rows { return Ok(()); } 
 
-        // 1. Construct the Equation Vector (Row)
+        // 1. Construct Equation Row for Intermediate Symbols
         let row_coeffs = if (symbol_id as usize) < self.block_size_k {
-            // Systematic: Identity Vector (e.g., [0, 1, 0...])
-            let mut r = alloc::vec![GfSymbol::ZERO; self.block_size_k];
+            // Systematic: Identity maps directly to IS[0..K]
+            let mut r = alloc::vec![GfSymbol::ZERO; self.extended_size_l];
             r[symbol_id as usize] = GfSymbol::ONE;
             r
         } else {
-            // Coded: Generator coefficients
-            let raw = generate_coefficients(symbol_id, self.gen_id, self.block_size_k);
+            // Coded: Generated from L intermediate symbols
+            let raw = generate_coefficients(symbol_id, self.gen_id, self.extended_size_l);
             raw.iter().map(|&b| GfSymbol(b)).collect()
         };
 
         // 2. Insert into Matrix
         let slot = self.count;
-        for c in 0..self.block_size_k {
+        for c in 0..self.extended_size_l {
             self.matrix.set(slot, c, row_coeffs[c]);
         }
         for c in 0..self.symbol_size {
@@ -97,42 +118,38 @@ impl FountainDecoder {
 
         self.count += 1;
         self.seen_symbols.push(symbol_id);
-        
         Ok(())
     }
 
     pub fn is_decodable(&self) -> bool {
-        self.count >= self.block_size_k
+        // We need L independent equations (including the S static constraints)
+        self.count >= self.extended_size_l
     }
 
-    /// Solve the system. Returns the original source data.
     pub fn decode(&self) -> M13Result<Vec<u8>> {
         if !self.is_decodable() { return Err(M13Error::InvalidState); }
 
         let rows = self.count;
-        let cols = self.block_size_k; 
+        let cols = self.extended_size_l; 
         
         let mut a = self.matrix.clone();
         let mut b = self.symbols.clone();
 
         let mut pivot_row = 0;
         
-        // Gaussian Elimination
+        // Gaussian Elimination solving for Intermediate Symbols
         for col_idx in 0..cols {
             if pivot_row >= rows { break; }
 
-            // Find Pivot
             let mut curr = pivot_row;
             while curr < rows && a.get(curr, col_idx) == Some(GfSymbol::ZERO) {
                 curr += 1;
             }
             
             if curr == rows { 
-                // Singular matrix (Dependent rows)
                 return Err(M13Error::CryptoFailure); 
             }
 
-            // Swap Rows
             if curr != pivot_row {
                 for c in 0..cols {
                     let temp = a.get(pivot_row, c).unwrap();
@@ -146,7 +163,6 @@ impl FountainDecoder {
                 }
             }
 
-            // Normalize Pivot
             let p_val = a.get(pivot_row, col_idx).unwrap();
             let inv = p_val.inv();
             
@@ -157,7 +173,6 @@ impl FountainDecoder {
                 b.set(pivot_row, c, b.get(pivot_row, c).unwrap() * inv);
             }
 
-            // Eliminate
             for r in 0..rows {
                 if r != pivot_row {
                     let factor = a.get(r, col_idx).unwrap();
@@ -176,9 +191,9 @@ impl FountainDecoder {
             pivot_row += 1;
         }
 
-        // Extract Result
-        let mut result = Vec::with_capacity(cols * self.symbol_size);
-        for r in 0..cols {
+        // Extract Source Symbols (0..K) from Intermediate Symbols (0..L)
+        let mut result = Vec::with_capacity(self.block_size_k * self.symbol_size);
+        for r in 0..self.block_size_k {
             for c in 0..self.symbol_size {
                 result.push(b.get(r, c).unwrap().0);
             }

@@ -8,13 +8,22 @@ use m13_cipher::generate_coefficients;
 
 /// Appendix D.1: Cap block size to prevent CPU exhaustion.
 pub const MAX_BLOCK_SYMBOLS: usize = 256; 
+/// [AUDIT FIX] RFC 6330 Pre-coding Overhead (Systematic LDPC)
+/// We define L = K + S, where S is the number of constraint symbols.
+const LDPC_OVERHEAD_S: usize = 16; 
 
 /// The Fountain Encoder.
 /// "Pours" symbols into the channel.
 pub struct FountainEncoder {
-    source_data: Vec<u8>,
+    // Stores Intermediate Symbols (IS)
+    // 0..K: Source Symbols
+    // K..L: Parity Symbols (LDPC)
+    intermediate_symbols: Vec<u8>,
+    
     symbol_size: usize,
-    block_size_k: usize,
+    block_size_k: usize, // K
+    extended_size_l: usize, // L = K + S
+    
     gen_id: u16,
     cursor: u32, // The current Symbol ID being generated
 }
@@ -30,50 +39,87 @@ impl FountainEncoder {
              return Err(M13Error::InvalidState); 
         }
 
+        let extended_size_l = block_size_k + LDPC_OVERHEAD_S;
+        let mut intermediate_symbols = alloc::vec![0u8; extended_size_l * symbol_size];
+
+        // 1. Fill Source Symbols (0..K)
+        for i in 0..block_size_k {
+            let start = i * symbol_size;
+            let src_start = i * symbol_size;
+            let src_end = core::cmp::min(src_start + symbol_size, data.len());
+            
+            let dest = &mut intermediate_symbols[start..start + symbol_size];
+            if src_start < data.len() {
+                dest[0..(src_end - src_start)].copy_from_slice(&data[src_start..src_end]);
+            }
+        }
+
+        // 2. [AUDIT FIX] PRE-CODING (Compute Parity K..L)
+        // Static LDPC Generation: P[i] = XOR sum of a pseudo-random subset of Source
+        for i in 0..LDPC_OVERHEAD_S {
+            let parity_idx = block_size_k + i;
+            // Generate constraint neighbors for this parity symbol
+            // Seed = gen_id + parity_index (Deterministic)
+            let seed = (gen_id as u32) << 16 | (parity_idx as u32);
+            let neighbors = generate_coefficients(seed, gen_id, block_size_k);
+            
+            let parity_start = parity_idx * symbol_size;
+            
+            // Temporary buffer to accumulate XOR sum
+            let mut acc = alloc::vec![0u8; symbol_size];
+            
+            for j in 0..block_size_k {
+                // Density control: Only use neighbor if coeff > 128 (50% density)
+                if neighbors[j] > 128 {
+                     let src_start = j * symbol_size;
+                     let src = &intermediate_symbols[src_start..src_start + symbol_size];
+                     for b in 0..symbol_size {
+                         acc[b] ^= src[b];
+                     }
+                }
+            }
+            
+            // Store Parity
+            intermediate_symbols[parity_start..parity_start + symbol_size].copy_from_slice(&acc);
+        }
+
         Ok(Self {
-            source_data: data.to_vec(),
+            intermediate_symbols,
             symbol_size,
             block_size_k,
+            extended_size_l,
             gen_id,
             cursor: 0,
         })
     }
 
     /// Produce the next packet in the stream.
-    /// 0..K: Systematic Symbols (The data itself).
-    /// K..∞: Repair Symbols (Linear Combinations).
+    /// 0..K: Systematic Symbols (Source Data).
+    /// K..∞: Repair Symbols (Linear Combinations of Intermediate Symbols).
     pub fn next_packet(&mut self) -> (M13Header, Vec<u8>) {
         let sym_id = self.cursor;
         self.cursor += 1;
 
         let payload = if (sym_id as usize) < self.block_size_k {
-            // SYSTEMATIC PHASE: Send raw slice
+            // SYSTEMATIC PHASE: Send raw source symbol
             let start = (sym_id as usize) * self.symbol_size;
-            let end = core::cmp::min(start + self.symbol_size, self.source_data.len());
-            
-            let mut chunk = self.source_data[start..end].to_vec();
-            // Padding if last symbol is partial
-            if chunk.len() < self.symbol_size {
-                chunk.resize(self.symbol_size, 0);
-            }
-            chunk
+            self.intermediate_symbols[start..start + self.symbol_size].to_vec()
         } else {
-            // REPAIR PHASE: Random Linear Combination
-            // Generate coefficients based on Symbol ID (Seed)
-            let coeffs_raw = generate_coefficients(sym_id, self.gen_id, self.block_size_k);
+            // REPAIR PHASE: Random Linear Combination of INTERMEDIATE Symbols (L)
+            // Note: We mix both Source and Parity symbols now.
+            let coeffs_raw = generate_coefficients(sym_id, self.gen_id, self.extended_size_l);
             
             let mut result = alloc::vec![GfSymbol::ZERO; self.symbol_size];
 
-            for i in 0..self.block_size_k {
+            for i in 0..self.extended_size_l {
                 let coeff = GfSymbol(coeffs_raw[i]);
                 if coeff == GfSymbol::ZERO { continue; }
 
-                // Get source symbol i
+                // Get intermediate symbol i
                 let start = i * self.symbol_size;
-                let end = core::cmp::min(start + self.symbol_size, self.source_data.len());
+                let chunk = &self.intermediate_symbols[start..start + self.symbol_size];
                 
-                // Safe slice access with zero padding logic implicit
-                for (j, &byte) in self.source_data[start..end].iter().enumerate() {
+                for (j, &byte) in chunk.iter().enumerate() {
                     result[j] = result[j] + (coeff * GfSymbol(byte));
                 }
             }
@@ -88,8 +134,8 @@ impl FountainEncoder {
             symbol_id: sym_id,
             payload_len: payload.len() as u16,
             recoder_rank: 0,
-            reserved: 0,
-            auth_tag: [0u8; 16], // Filled by Cipher later
+            reserved: k_to_reserved(self.block_size_k), 
+            auth_tag: [0u8; 16],
         };
 
         (header, payload)
@@ -98,4 +144,8 @@ impl FountainEncoder {
     pub fn num_source_symbols(&self) -> usize {
         self.block_size_k
     }
+}
+
+fn k_to_reserved(k: usize) -> u8 {
+    if k > 255 { 255 } else { k as u8 }
 }
